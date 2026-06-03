@@ -44,6 +44,7 @@ Example::
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 from pathlib import Path
@@ -286,6 +287,7 @@ def _strip_future_imports(src: str) -> str:
     return "\n".join(lines) + ("\n" if src.endswith("\n") else "")
 
 
+@functools.lru_cache(maxsize=None)
 def _render_init_source(fn: Callable) -> str:
     """Return self-contained source code for *fn* suitable for embedding in JSON.
 
@@ -340,11 +342,20 @@ def _render_init_source(fn: Callable) -> str:
     return "".join(parts)
 
 
+@functools.lru_cache(maxsize=None)
 def _render_reference_source(fn: Callable) -> str:
     """Return reference source with imports needed for standalone exec()."""
     import inspect  # noqa: PLC0415
 
     return _REFERENCE_PREAMBLE + inspect.getsource(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def _get_callable_source(fn: Callable) -> str:
+    """Return source code for a stable template callable."""
+    import inspect  # noqa: PLC0415
+
+    return inspect.getsource(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +642,33 @@ class TraceTemplate:
         """
         axis_extractors = self._build_axis_extractors()
         template = self  # capture in closure
+        result_cache: Dict[str, Dict[str, Any]] = {}
+
+        def _resolve_name(
+            explicit_name: Optional[str],
+            axis_values: Dict[str, int],
+        ) -> str:
+            if explicit_name is not None:
+                return explicit_name
+
+            # Use name_prefix from the template when set (preferred: short,
+            # semantic names like "gqa_paged_decode", "gdn_mtp"). Fall back to
+            # op_type otherwise.
+            prefix = (
+                template.name_prefix
+                if template.name_prefix is not None
+                else template.op_type
+            )
+            const_parts = []
+            for n, marker in template.axes.items():
+                if not isinstance(marker, Const) or n not in axis_values:
+                    continue
+                # abbrev="" -> omit from name; abbrev=None -> use axis name
+                pfx = marker.abbrev if marker.abbrev is not None else n
+                if pfx == "":
+                    continue
+                const_parts.append(f"{pfx}{axis_values[n]}")
+            return prefix + ("_" + "_".join(const_parts) if const_parts else "")
 
         def fi_trace(
             save_dir: Optional[Union[str, Path]] = None,
@@ -646,6 +684,18 @@ class TraceTemplate:
                         axis_values[axis_name] = val
                 except Exception:
                     pass
+
+            # ── 2. Resolve name and auto-dump fast path ───────────────────
+            name = _resolve_name(name, axis_values)
+            effective_dir = save_dir if save_dir is not None else _get_trace_dump_dir()
+            _is_auto_dump = save_dir is None
+            if (
+                _is_auto_dump
+                and effective_dir is not None
+                and name in _DUMPED_NAMES
+                and name in result_cache
+            ):
+                return result_cache[name]
 
             # ── 3. Build "axes" section ────────────────────────────────────
             axes_json: Dict[str, Any] = {}
@@ -719,27 +769,6 @@ class TraceTemplate:
                     entry["description"] = descriptor.description
                 outputs_json[json_key] = entry
 
-            # ── 6. Resolve name (explicit override or auto-generate) ──────
-            if name is None:
-                # Use name_prefix from the template when set (preferred: short,
-                # semantic names like "gqa_paged_decode", "gdn_mtp").
-                # Fall back to op_type otherwise.
-                prefix = (
-                    template.name_prefix
-                    if template.name_prefix is not None
-                    else template.op_type
-                )
-                const_parts = []
-                for n, marker in template.axes.items():
-                    if not isinstance(marker, Const) or n not in axis_values:
-                        continue
-                    # abbrev="" → omit from name; abbrev=None → use axis name
-                    pfx = marker.abbrev if marker.abbrev is not None else n
-                    if pfx == "":
-                        continue
-                    const_parts.append(f"{pfx}{axis_values[n]}")
-                name = prefix + ("_" + "_".join(const_parts) if const_parts else "")
-
             # ── 7. Assemble definition ─────────────────────────────────────
             all_tags = [f"fi_api:{fi_api}"] + template.tags
             result: Dict[str, Any] = {
@@ -758,9 +787,7 @@ class TraceTemplate:
                     result["reference"] = _render_reference_source(template.reference)
             if template.check is not None:
                 with contextlib.suppress(OSError, TypeError):
-                    import inspect  # noqa: PLC0415
-
-                    result["check"] = inspect.getsource(template.check)
+                    result["check"] = _get_callable_source(template.check)
             if template.init is not None:
                 with contextlib.suppress(OSError, TypeError):
                     result["init"] = _render_init_source(template.init)
@@ -769,8 +796,6 @@ class TraceTemplate:
             # Deduplication only applies to auto-dump (save_dir=None): once a
             # named trace has been auto-dumped this process, skip re-writing it.
             # Explicit save_dir= calls always write (no dedup).
-            effective_dir = save_dir if save_dir is not None else _get_trace_dump_dir()
-            _is_auto_dump = save_dir is None
             if effective_dir is not None and (
                 not _is_auto_dump or name not in _DUMPED_NAMES
             ):
@@ -780,6 +805,9 @@ class TraceTemplate:
                 out_path.write_text(json.dumps(result, indent=2))
                 if _is_auto_dump:
                     _DUMPED_NAMES.add(name)
+
+            if _is_auto_dump:
+                result_cache[name] = result
 
             return result
 

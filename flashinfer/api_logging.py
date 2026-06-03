@@ -2187,6 +2187,90 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 _TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
 
 
+def _build_fast_bound_arguments(
+    sig: inspect.Signature,
+) -> Optional[Callable[[tuple, dict], Dict[str, Any]]]:
+    """Build a lightweight ``Signature.bind(...).apply_defaults()`` equivalent.
+
+    FI trace auto-dump runs on hot inference paths, and ``inspect.Signature``
+    binding is noticeably expensive at tens of thousands of calls. Most
+    FlashInfer APIs have simple Python signatures, so precompute the parameter
+    layout once and bind calls with direct tuple/dict operations. Unusual
+    signatures fall back to ``Signature.bind`` in the caller.
+    """
+
+    parameters = tuple(sig.parameters.values())
+    unsupported_kinds = {
+        inspect.Parameter.VAR_POSITIONAL,
+        inspect.Parameter.VAR_KEYWORD,
+    }
+    if any(param.kind in unsupported_kinds for param in parameters):
+        return None
+
+    positional_names = tuple(
+        param.name
+        for param in parameters
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    )
+    keyword_names = frozenset(
+        param.name
+        for param in parameters
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    )
+    defaults = tuple(
+        (param.name, param.default)
+        for param in parameters
+        if param.default is not inspect.Parameter.empty
+    )
+    required_names = tuple(
+        param.name
+        for param in parameters
+        if param.default is inspect.Parameter.empty
+        and param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    )
+    positional_count = len(positional_names)
+
+    def bind(args: tuple, kwargs: dict) -> Dict[str, Any]:
+        if len(args) > positional_count:
+            raise TypeError("too many positional arguments")
+
+        bound: Dict[str, Any] = {}
+        for idx, value in enumerate(args):
+            bound[positional_names[idx]] = value
+
+        for name, value in kwargs.items():
+            if name in bound:
+                raise TypeError(f"multiple values for argument '{name}'")
+            if name not in keyword_names:
+                raise TypeError(f"got an unexpected keyword argument '{name}'")
+            bound[name] = value
+
+        for name, default in defaults:
+            if name not in bound:
+                bound[name] = default
+
+        for name in required_names:
+            if name not in bound:
+                raise TypeError(f"missing required argument '{name}'")
+
+        return bound
+
+    return bind
+
+
 def _attach_fi_trace(
     wrapped: Callable,
     original: Callable,
@@ -2299,6 +2383,7 @@ def _attach_fi_trace(
             # when running via ``python -m``).
             _inner = wrapped
             _sig = inspect.signature(original)
+            _fast_bind_arguments = _build_fast_bound_arguments(_sig)
 
             # Track which (function, error-type) pairs have already been warned
             # about so we emit at most one diagnostic per failure class per process.
@@ -2311,9 +2396,13 @@ def _attach_fi_trace(
                 # computation succeeds).
                 if _is_trace_dump_enabled():
                     try:
-                        bound = _sig.bind(*args, **kwargs)
-                        bound.apply_defaults()
-                        fi_trace_fn(**dict(bound.arguments))
+                        if _fast_bind_arguments is not None:
+                            trace_kwargs = _fast_bind_arguments(args, kwargs)
+                        else:
+                            bound = _sig.bind(*args, **kwargs)
+                            bound.apply_defaults()
+                            trace_kwargs = dict(bound.arguments)
+                        fi_trace_fn(**trace_kwargs)
                     except Exception as _exc:
                         # Non-fatal: the API call still runs. Warn once per
                         # (function, error-type) so users get a diagnostic

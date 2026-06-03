@@ -679,6 +679,50 @@ def test_fi_trace_env_var_writes_json_file(tmp_path, monkeypatch):
     assert json.loads(expected_file.read_text())["op_type"] == "sampling"
 
 
+def test_fi_trace_auto_dump_uses_cached_definition(tmp_path, monkeypatch):
+    """Repeated auto-dump calls should not rebuild source-heavy sections."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.trace.template import Const, Tensor, TraceTemplate, Var
+
+    def reference(input):
+        return input
+
+    def init(*, batch_size: int, hidden_size: int = 4):
+        return {"input": torch.randn(batch_size, hidden_size)}
+
+    template = TraceTemplate(
+        op_type="cache_test",
+        axes={"batch_size": Var(), "hidden_size": Const(abbrev="h")},
+        inputs={"input": Tensor(["batch_size", "hidden_size"])},
+        outputs={"output": Tensor(["batch_size", "hidden_size"], dtype_from="input")},
+        reference=reference,
+        init=init,
+    )
+    fi_trace_fn = template.build_fi_trace_fn("flashinfer.tests.cache_test")
+    dumped_names = template_mod._DUMPED_NAMES
+    previous_dumped_names = set(dumped_names)
+    dumped_names.clear()
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path))
+
+    try:
+        input_tensor = torch.randn(2, 4)
+        first = fi_trace_fn(input=input_tensor)
+
+        def fail_render(*args, **kwargs):
+            raise AssertionError("auto-dump cache miss")
+
+        monkeypatch.setattr(template_mod, "_render_reference_source", fail_render)
+        monkeypatch.setattr(template_mod, "_render_init_source", fail_render)
+        monkeypatch.setattr(template_mod, "_get_callable_source", fail_render)
+
+        second = fi_trace_fn(input=input_tensor)
+        assert second == first
+        assert (tmp_path / f"{first['name']}.json").exists()
+    finally:
+        dumped_names.clear()
+        dumped_names.update(previous_dumped_names)
+
+
 def test_fi_trace_creates_nested_save_dir(tmp_path):
     """save_dir is created automatically even if it doesn't exist yet."""
     import flashinfer.norm
