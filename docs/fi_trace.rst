@@ -27,6 +27,8 @@ Set two environment variables **before** importing FlashInfer:
 
 FlashInfer writes one ``.json`` file per unique (op, shape) combination.
 Subsequent calls with the same shapes are deduplicated — no duplicate files.
+Optionally, FlashInfer can also collect workload-axis counts that show how
+often each runtime ``Var`` axis value was observed.
 
 .. code-block:: text
 
@@ -34,6 +36,9 @@ Subsequent calls with the same shapes are deduplicated — no duplicate files.
     ├── rmsnorm_h7168.json
     ├── gqa_paged_decode_h32_kv8_d128_ps16.json
     ├── moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.json
+    ├── workloads/
+    │   └── rmsnorm/
+    │       └── rmsnorm_h7168.pid_12345.jsonl
     └── ...
 
 Environment Variables
@@ -55,9 +60,72 @@ Environment Variables
      - str
      - ``./fi_trace_out``
      - Directory where JSON files are written.
+   * - ``FLASHINFER_TRACE_WORKLOAD_DUMP``
+     - int
+     - ``0``
+     - Set to ``1`` to collect per-call ``Var`` axis values as aggregated
+       workload sidecar shards.
+   * - ``FLASHINFER_TRACE_WORKLOAD_DUMP_DIR``
+     - str
+     - ``$FLASHINFER_TRACE_DUMP_DIR/workloads``
+     - Directory where workload-axis JSONL shards are written.  If
+       ``FLASHINFER_TRACE_DUMP_DIR`` is unset, defaults to
+       ``./fi_trace_workloads``.
 
-Both variables are read **lazily at call time**, so they can be set after
+These variables are read **lazily at call time**, so they can be set after
 ``import flashinfer`` (e.g. when using ``python -m``).
+
+Workload-Axis Sidecar Dumps
+---------------------------
+
+Trace definition JSONs describe which operations and shapes are possible, but
+they do not tell you how often each runtime axis value occurs in a serving
+run.  Workload-axis sidecar dumps fill that gap.  When
+``FLASHINFER_TRACE_WORKLOAD_DUMP=1`` is enabled, FlashInfer records the
+``Var`` axes observed on decorated API calls, aggregates counts in memory, and
+flushes per-process JSONL shards.
+
+This is useful when building a benchmark suite from a production workload:
+
+* you can prioritize the batch sizes, sequence lengths, token counts, and
+  routing sizes that actually occurred;
+* repeated calls with the same trace definition still contribute frequency
+  information instead of disappearing behind trace-definition deduplication;
+* distributed serving processes write separate ``pid`` shards, avoiding
+  cross-rank file write races;
+* downstream tooling can combine shards by summing matching ``(name, axes)``
+  records.
+
+Typical usage enables both trace definitions and workload-axis counts:
+
+.. code-block:: bash
+
+    export FLASHINFER_TRACE_DUMP=1
+    export FLASHINFER_TRACE_DUMP_DIR=./fi_trace_out
+    export FLASHINFER_TRACE_WORKLOAD_DUMP=1
+
+    python my_inference_script.py
+
+Workload collection can also run without definition dumping when you only need
+axis-frequency telemetry:
+
+.. code-block:: bash
+
+    export FLASHINFER_TRACE_WORKLOAD_DUMP=1
+    export FLASHINFER_TRACE_WORKLOAD_DUMP_DIR=./fi_workload_out
+
+    python my_inference_script.py
+
+Shard files are written under ``<root>/<op_type>/<name>.pid_<pid>.jsonl``.
+Each line is one aggregated axis tuple:
+
+.. code-block:: json
+
+    {"axes": {"batch_size": 4}, "count": 128}
+
+For example, ``rmsnorm_h7168.pid_12345.jsonl`` may contain one line for each
+batch size seen by that process.  Add counts across all ``pid`` shards to get
+the full workload distribution for that trace definition.
 
 JSON File Format
 ----------------

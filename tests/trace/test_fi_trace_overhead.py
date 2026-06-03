@@ -39,15 +39,41 @@ def isolated_trace_dump_state(monkeypatch):
     import flashinfer.trace.template as template_mod
 
     previous_dumped_names = set(template_mod._DUMPED_NAMES)
+    previous_workload_counts = dict(template_mod._WORKLOAD_AXIS_COUNTS)
+    previous_workload_metadata = dict(template_mod._WORKLOAD_AXIS_METADATA)
+    previous_workload_metadata_ids = dict(template_mod._WORKLOAD_AXIS_METADATA_IDS)
+    previous_workload_next_metadata_id = template_mod._WORKLOAD_AXIS_NEXT_METADATA_ID
+    previous_workload_record_count = template_mod._WORKLOAD_AXIS_RECORD_COUNT
+    previous_workload_pid_markers = set(template_mod._WORKLOAD_AXIS_PID_MARKERS)
     template_mod._DUMPED_NAMES.clear()
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    template_mod._WORKLOAD_AXIS_METADATA.clear()
+    template_mod._WORKLOAD_AXIS_METADATA_IDS.clear()
+    template_mod._WORKLOAD_AXIS_NEXT_METADATA_ID = 0
+    template_mod._WORKLOAD_AXIS_RECORD_COUNT = 0
+    template_mod._WORKLOAD_AXIS_PID_MARKERS.clear()
     _clear_trace_source_caches(template_mod)
     monkeypatch.delenv("FLASHINFER_TRACE_DUMP", raising=False)
     monkeypatch.delenv("FLASHINFER_TRACE_DUMP_DIR", raising=False)
+    monkeypatch.delenv("FLASHINFER_TRACE_WORKLOAD_DUMP", raising=False)
+    monkeypatch.delenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", raising=False)
     try:
         yield
     finally:
         template_mod._DUMPED_NAMES.clear()
         template_mod._DUMPED_NAMES.update(previous_dumped_names)
+        template_mod._WORKLOAD_AXIS_COUNTS.clear()
+        template_mod._WORKLOAD_AXIS_COUNTS.update(previous_workload_counts)
+        template_mod._WORKLOAD_AXIS_METADATA.clear()
+        template_mod._WORKLOAD_AXIS_METADATA.update(previous_workload_metadata)
+        template_mod._WORKLOAD_AXIS_METADATA_IDS.clear()
+        template_mod._WORKLOAD_AXIS_METADATA_IDS.update(previous_workload_metadata_ids)
+        template_mod._WORKLOAD_AXIS_NEXT_METADATA_ID = (
+            previous_workload_next_metadata_id
+        )
+        template_mod._WORKLOAD_AXIS_RECORD_COUNT = previous_workload_record_count
+        template_mod._WORKLOAD_AXIS_PID_MARKERS.clear()
+        template_mod._WORKLOAD_AXIS_PID_MARKERS.update(previous_workload_pid_markers)
         _clear_trace_source_caches(template_mod)
 
 
@@ -211,7 +237,36 @@ def test_fi_trace_auto_dump_mixed_repeated_shape_overhead_stays_low(
         f"enabled={enabled_ns:.1f} ns/call disabled={disabled_ns:.1f} ns/call "
         f"overhead={overhead_ns:.1f} ns/call"
     )
-    assert len(list(tmp_path.glob("*.json"))) == len(inputs)
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+def test_fi_trace_workload_axis_overhead_stays_low(
+    tmp_path, monkeypatch, isolated_trace_dump_state
+):
+    from flashinfer.trace.template import flush_workload_axis_dumps
+
+    wrapped = _make_wrapped_rmsnorm_noop()
+    x, weight = _make_rmsnorm_inputs(4)
+
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path / "defs"))
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
+    monkeypatch.setenv(
+        "FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path / "workloads")
+    )
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    wrapped(x, weight)
+
+    enabled_ns = _median_ns_per_call(lambda: wrapped(x, weight), calls=2048)
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "0")
+    dump_only_ns = _median_ns_per_call(lambda: wrapped(x, weight), calls=2048)
+    workload_overhead_ns = max(0.0, enabled_ns - dump_only_ns)
+
+    assert workload_overhead_ns < 15_000, (
+        "FI trace workload-axis collection overhead regressed: "
+        f"enabled={enabled_ns:.1f} ns/call dump_only={dump_only_ns:.1f} ns/call "
+        f"overhead={workload_overhead_ns:.1f} ns/call"
+    )
+    assert flush_workload_axis_dumps() == 1
 
 
 def test_fi_trace_unique_shape_generation_amortizes_source_rendering(
