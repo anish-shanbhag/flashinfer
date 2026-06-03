@@ -17,6 +17,8 @@ limitations under the License.
 """Tests for flashinfer.fi_trace: definition JSON generation."""
 
 import json
+import os
+import signal
 from contextlib import suppress
 
 import torch
@@ -678,6 +680,283 @@ def test_fi_trace_env_var_writes_json_file(tmp_path, monkeypatch):
     assert expected_file.exists(), f"Expected file {expected_file}"
     assert json.loads(expected_file.read_text())["op_type"] == "sampling"
 
+def test_fi_trace_workload_axis_dump_writes_pid_shards(tmp_path, monkeypatch):
+    """Workload-axis dump aggregates Var axes without logging every API call."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.trace.template import (
+        Const,
+        Tensor,
+        TraceTemplate,
+        Var,
+        flush_workload_axis_dumps,
+    )
+
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path))
+
+    template = TraceTemplate(
+        op_type="workload_test",
+        axes={"batch_size": Var(), "hidden_size": Const(abbrev="h")},
+        inputs={"input": Tensor(["batch_size", "hidden_size"])},
+        outputs={"output": Tensor(["batch_size", "hidden_size"], dtype_from="input")},
+    )
+    fi_trace_fn = template.build_fi_trace_fn("flashinfer.tests.workload_test")
+
+    fi_trace_fn(input=torch.empty((2, 4)))
+    fi_trace_fn(input=torch.empty((3, 4)))
+    fi_trace_fn(input=torch.empty((2, 4)))
+
+    flush_workload_axis_dumps()
+    out_path = tmp_path / "workload_test" / f"workload_test_h4.pid_{os.getpid()}.jsonl"
+    records = [json.loads(line) for line in out_path.read_text().splitlines()]
+    counts = {}
+    for record in records:
+        key = tuple(sorted(record["axes"].items()))
+        counts[key] = counts.get(key, 0) + record["count"]
+
+    assert counts == {
+        (("batch_size", 2),): 2,
+        (("batch_size", 3),): 1,
+    }
+    assert flush_workload_axis_dumps() == 0
+
+
+def test_fi_trace_workload_axis_dump_default_dir(tmp_path, monkeypatch):
+    """The workload dir defaults under FLASHINFER_TRACE_DUMP_DIR."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.trace.template import Tensor, TraceTemplate, Var
+    from flashinfer.trace.template import flush_workload_axis_dumps
+
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path / "defs"))
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    monkeypatch.delenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", raising=False)
+
+    template = TraceTemplate(
+        op_type="default_workload_dir_test",
+        axes={"n": Var()},
+        inputs={"input": Tensor(["n"])},
+        outputs={"output": Tensor(["n"], dtype_from="input")},
+    )
+    fi_trace_fn = template.build_fi_trace_fn("flashinfer.tests.default_workload_dir")
+
+    fi_trace_fn(input=torch.empty((5,)))
+    flush_workload_axis_dumps()
+
+    out_path = (
+        tmp_path
+        / "defs"
+        / "workloads"
+        / "default_workload_dir_test"
+        / f"default_workload_dir_test.pid_{os.getpid()}.jsonl"
+    )
+    assert json.loads(out_path.read_text()) == {"axes": {"n": 5}, "count": 1}
+
+
+def test_fi_trace_workload_axis_dump_via_decorator_without_trace_dump(
+    tmp_path, monkeypatch
+):
+    """The API wrapper can collect workloads even when definition dump is off."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.api_logging import _attach_fi_trace
+    from flashinfer.trace.template import Tensor, TraceTemplate, Var
+    from flashinfer.trace.template import flush_workload_axis_dumps
+
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path))
+    monkeypatch.delenv("FLASHINFER_TRACE_DUMP", raising=False)
+    monkeypatch.delenv("FLASHINFER_TRACE_DUMP_DIR", raising=False)
+
+    template = TraceTemplate(
+        op_type="wrapper_workload_test",
+        axes={"n": Var()},
+        inputs={"input": Tensor(["n"])},
+        outputs={"output": Tensor(["n"], dtype_from="input")},
+    )
+
+    def api(input):
+        return input
+
+    wrapped = _attach_fi_trace(api, api, trace_template=template)
+    wrapped(torch.empty((7,)))
+    flush_workload_axis_dumps()
+
+    assert not list(tmp_path.glob("*.json"))
+    out_path = tmp_path / "wrapper_workload_test" / f"wrapper_workload_test.pid_{os.getpid()}.jsonl"
+    assert json.loads(out_path.read_text()) == {"axes": {"n": 7}, "count": 1}
+
+
+def test_fi_trace_workload_axis_dump_via_decorator_with_trace_dump_counts_once(
+    tmp_path, monkeypatch
+):
+    """The split auto-dump path should not double-count workload samples."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.api_logging import _attach_fi_trace
+    from flashinfer.trace.template import Const, Tensor, TraceTemplate, Var
+    from flashinfer.trace.template import flush_workload_axis_dumps
+
+    template_mod._DUMPED_NAMES.clear()
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path / "defs"))
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path / "workloads"))
+
+    template = TraceTemplate(
+        op_type="wrapper_trace_workload_test",
+        axes={"n": Var(), "h": Const(abbrev="h")},
+        inputs={"input": Tensor(["n", "h"])},
+        outputs={"output": Tensor(["n", "h"], dtype_from="input")},
+    )
+
+    def api(input):
+        return input
+
+    wrapped = _attach_fi_trace(api, api, trace_template=template)
+    wrapped(torch.empty((7, 4)))
+    wrapped(torch.empty((7, 4)))
+    flush_workload_axis_dumps()
+
+    assert (tmp_path / "defs" / "wrapper_trace_workload_test_h4.json").exists()
+    out_path = (
+        tmp_path
+        / "workloads"
+        / "wrapper_trace_workload_test"
+        / f"wrapper_trace_workload_test_h4.pid_{os.getpid()}.jsonl"
+    )
+    assert json.loads(out_path.read_text()) == {"axes": {"n": 7}, "count": 2}
+
+
+def test_fi_trace_workload_axis_autoflush_handles_sigint(tmp_path, monkeypatch):
+    """SGLang-style SIGINT shutdown flushes pending workload-axis records."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.trace.template import Tensor, TraceTemplate, Var
+    from flashinfer.trace.template import flush_workload_axis_dumps
+
+    previous_autoflush = template_mod._WORKLOAD_AXIS_AUTOFLUSH_INSTALLED
+    previous_signal_handlers = dict(template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS)
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS.clear()
+    template_mod._WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = False
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path))
+
+    registered_handlers = {}
+
+    def fake_getsignal(signum):
+        return signal.SIG_IGN
+
+    def fake_signal(signum, handler):
+        registered_handlers[signum] = handler
+
+    monkeypatch.setattr(signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(signal, "signal", fake_signal)
+
+    try:
+        template = TraceTemplate(
+            op_type="sigint_workload_test",
+            axes={"n": Var()},
+            inputs={"input": Tensor(["n"])},
+            outputs={"output": Tensor(["n"], dtype_from="input")},
+        )
+        fi_trace_fn = template.build_fi_trace_fn("flashinfer.tests.sigint_workload")
+
+        fi_trace_fn(input=torch.empty((9,)))
+
+        assert signal.SIGINT in registered_handlers
+        assert signal.SIGTERM in registered_handlers
+
+        registered_handlers[signal.SIGINT](signal.SIGINT, None)
+
+        out_path = (
+            tmp_path
+            / "sigint_workload_test"
+            / f"sigint_workload_test.pid_{os.getpid()}.jsonl"
+        )
+        assert json.loads(out_path.read_text()) == {"axes": {"n": 9}, "count": 1}
+        assert flush_workload_axis_dumps() == 0
+    finally:
+        template_mod._WORKLOAD_AXIS_COUNTS.clear()
+        template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS.clear()
+        template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS.update(previous_signal_handlers)
+        template_mod._WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = previous_autoflush
+
+
+def test_fi_trace_workload_axis_autoflush_rewraps_replaced_signal_handler(
+    tmp_path, monkeypatch
+):
+    """Refresh signal wrappers if the host framework replaces them later."""
+    import flashinfer.trace.template as template_mod
+    from flashinfer.trace.template import Tensor, TraceTemplate, Var
+
+    previous_autoflush = template_mod._WORKLOAD_AXIS_AUTOFLUSH_INSTALLED
+    previous_record_count = template_mod._WORKLOAD_AXIS_RECORD_COUNT
+    previous_signal_handlers = dict(template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS)
+    template_mod._WORKLOAD_AXIS_COUNTS.clear()
+    template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS.clear()
+    template_mod._WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = False
+    template_mod._WORKLOAD_AXIS_RECORD_COUNT = 0
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path))
+
+    current_handlers = {
+        signal.SIGINT: signal.SIG_IGN,
+        signal.SIGTERM: signal.SIG_IGN,
+    }
+    replacement_calls = []
+
+    def fake_getsignal(signum):
+        return current_handlers.get(signum, signal.SIG_DFL)
+
+    def fake_signal(signum, handler):
+        current_handlers[signum] = handler
+
+    def replacement_handler(signum, frame):
+        replacement_calls.append(signum)
+
+    monkeypatch.setattr(signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(signal, "signal", fake_signal)
+
+    try:
+        template = TraceTemplate(
+            op_type="rewrap_workload_test",
+            axes={"n": Var()},
+            inputs={"input": Tensor(["n"])},
+            outputs={"output": Tensor(["n"], dtype_from="input")},
+        )
+        fi_trace_fn = template.build_fi_trace_fn("flashinfer.tests.rewrap_workload")
+
+        fi_trace_fn(input=torch.empty((11,)))
+        first_sigterm_handler = current_handlers[signal.SIGTERM]
+        current_handlers[signal.SIGTERM] = replacement_handler
+        template_mod._WORKLOAD_AXIS_RECORD_COUNT = (
+            template_mod._WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY - 1
+        )
+
+        fi_trace_fn(input=torch.empty((11,)))
+
+        refreshed_sigterm_handler = current_handlers[signal.SIGTERM]
+        assert refreshed_sigterm_handler is not first_sigterm_handler
+        assert refreshed_sigterm_handler is not replacement_handler
+
+        refreshed_sigterm_handler(signal.SIGTERM, None)
+
+        out_path = (
+            tmp_path
+            / "rewrap_workload_test"
+            / f"rewrap_workload_test.pid_{os.getpid()}.jsonl"
+        )
+        count = sum(json.loads(line)["count"] for line in out_path.read_text().splitlines())
+        assert count == 2
+        assert replacement_calls == [signal.SIGTERM]
+    finally:
+        template_mod._WORKLOAD_AXIS_COUNTS.clear()
+        template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS.clear()
+        template_mod._WORKLOAD_AXIS_SIGNAL_HANDLERS.update(previous_signal_handlers)
+        template_mod._WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = previous_autoflush
+        template_mod._WORKLOAD_AXIS_RECORD_COUNT = previous_record_count
 
 def test_fi_trace_creates_nested_save_dir(tmp_path):
     """save_dir is created automatically even if it doesn't exist yet."""

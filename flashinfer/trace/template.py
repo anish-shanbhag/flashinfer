@@ -44,6 +44,7 @@ Example::
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -73,6 +74,142 @@ _TRACE_DUMP_ENABLED: bool = _is_trace_dump_enabled()
 
 # In-memory deduplication: names of traces already written this process.
 _DUMPED_NAMES: set = set()
+
+# Workload-axis collection records the Var-axis tuple seen for each auto-dumped
+# trace definition. Counts stay in memory on the hot path and are flushed as
+# per-process shards, avoiding both per-call file I/O and cross-rank write races.
+_WORKLOAD_AXIS_COUNTS: Dict[
+    Tuple[str, str, str, Tuple[Tuple[str, int], ...]], int
+] = {}
+_WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = False
+_WORKLOAD_AXIS_SIGNAL_HANDLERS: Dict[int, Any] = {}
+_WORKLOAD_AXIS_RECORD_COUNT = 0
+_WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY = 1024
+
+
+def _is_trace_workload_dump_enabled() -> bool:
+    """Return True if workload-axis aggregation is enabled."""
+    return os.environ.get("FLASHINFER_TRACE_WORKLOAD_DUMP", "0") not in ("0", "")
+
+
+def _get_trace_workload_dump_dir() -> str:
+    """Return the workload-axis output root.
+
+    Defaults to a ``workloads`` subdirectory under ``FLASHINFER_TRACE_DUMP_DIR``
+    so definition JSONs and workload-axis shards stay co-located.
+    """
+    explicit_dir = os.environ.get("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR")
+    if explicit_dir:
+        return explicit_dir
+    trace_dir = _get_trace_dump_dir()
+    if trace_dir:
+        return str(Path(trace_dir) / "workloads")
+    return "fi_trace_workloads"
+
+
+def _install_workload_axis_autoflush(*, force: bool = False) -> None:
+    global _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED
+    if _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED and not force:
+        return
+
+    try:
+        import atexit
+        import signal
+    except Exception:  # pragma: no cover
+        return
+
+    if not _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED:
+        atexit.register(flush_workload_axis_dumps)
+        _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = True
+
+    def _make_signal_flush_handler(previous_handler):
+        def _signal_flush(signum, frame):
+            flush_workload_axis_dumps()
+            if callable(previous_handler):
+                previous_handler(signum, frame)
+            elif previous_handler == signal.SIG_DFL:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+        return _signal_flush
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(ValueError, OSError):
+            previous_handler = signal.getsignal(signum)
+            if previous_handler is _WORKLOAD_AXIS_SIGNAL_HANDLERS.get(signum):
+                continue
+            signal.signal(signum, _make_signal_flush_handler(previous_handler))
+            _WORKLOAD_AXIS_SIGNAL_HANDLERS[signum] = signal.getsignal(signum)
+
+
+def _record_workload_axis_sample(
+    *,
+    output_root: str,
+    op_type: str,
+    name: str,
+    var_axis_names: Tuple[str, ...],
+    axis_values: Dict[str, int],
+) -> None:
+    """Increment the in-memory workload-axis counter for one observed call."""
+    axes = tuple(
+        (axis_name, int(axis_values[axis_name]))
+        for axis_name in var_axis_names
+        if axis_name in axis_values
+    )
+    _record_workload_axis_key(
+        output_root=output_root,
+        op_type=op_type,
+        name=name,
+        axes=axes,
+    )
+
+
+def _record_workload_axis_key(
+    *,
+    output_root: str,
+    op_type: str,
+    name: str,
+    axes: Tuple[Tuple[str, int], ...],
+) -> None:
+    """Increment the in-memory workload-axis counter for one prepared key."""
+    global _WORKLOAD_AXIS_RECORD_COUNT
+    key = (output_root, op_type, name, axes)
+    _WORKLOAD_AXIS_COUNTS[key] = _WORKLOAD_AXIS_COUNTS.get(key, 0) + 1
+    _WORKLOAD_AXIS_RECORD_COUNT += 1
+    if _WORKLOAD_AXIS_RECORD_COUNT % _WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY == 0:
+        _install_workload_axis_autoflush(force=True)
+
+
+def flush_workload_axis_dumps() -> int:
+    """Flush workload-axis counts to per-process JSONL shard files.
+
+    Files are written as ``<root>/<op_type>/<name>.pid_<pid>.jsonl``. A
+    downstream collector can aggregate duplicate axes across process shards by
+    summing ``count`` for matching ``(name, axes)`` records.
+    """
+    if not _WORKLOAD_AXIS_COUNTS:
+        return 0
+
+    pending = list(_WORKLOAD_AXIS_COUNTS.items())
+    _WORKLOAD_AXIS_COUNTS.clear()
+    grouped: Dict[
+        Tuple[str, str, str],
+        List[Tuple[Tuple[Tuple[str, int], ...], int]],
+    ] = {}
+    for (output_root, op_type, name, axes), count in pending:
+        grouped.setdefault((output_root, op_type, name), []).append((axes, count))
+
+    pid = os.getpid()
+    records_written = 0
+    for (output_root, op_type, name), records in grouped.items():
+        out_dir = Path(output_root) / op_type
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{name}.pid_{pid}.jsonl"
+        with out_path.open("a") as f:
+            for axes, count in sorted(records, key=lambda item: item[0]):
+                f.write(json.dumps({"axes": dict(axes), "count": count}) + "\n")
+                records_written += 1
+    return records_written
 
 # ---------------------------------------------------------------------------
 # Dtype helpers
@@ -254,6 +391,9 @@ def _get_tensor(
         else:
             return None
     return val if isinstance(val, torch.Tensor) else None
+
+
+_MISSING = object()
 
 
 # ---------------------------------------------------------------------------
@@ -616,11 +756,144 @@ class TraceTemplate:
 
         return extractors
 
+    def build_workload_axis_recorder(
+        self,
+        sig: inspect.Signature,
+    ) -> Optional[Callable[[tuple, Dict[str, Any]], Optional[str]]]:
+        """Build a lightweight auto-dump recorder for workload-axis counts.
+
+        This bypasses full ``Signature.bind`` and the definition-building half of
+        ``fi_trace`` on repeated hot-path calls. It is intentionally limited to
+        ordinary signatures; callers should fall back to ``fi_trace`` when the
+        function accepts ``*args`` or ``**kwargs``.
+        """
+
+        parameters = tuple(sig.parameters.values())
+        if any(
+            param.kind
+            in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for param in parameters
+        ):
+            return None
+
+        positional_positions: Dict[str, int] = {}
+        positional_idx = 0
+        defaults: Dict[str, Any] = {}
+        for param in parameters:
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                positional_positions[param.name] = positional_idx
+                positional_idx += 1
+            if param.default is not inspect.Parameter.empty:
+                defaults[param.name] = param.default
+
+        template = self
+        name_prefix = (
+            template.name_prefix
+            if template.name_prefix is not None
+            else template.op_type
+        )
+        axis_readers = []
+        for axis_name, marker in template.axes.items():
+            source = None
+            for json_key, descriptor in self.inputs.items():
+                if not isinstance(descriptor, Tensor):
+                    continue
+                if axis_name not in descriptor.dim_names:
+                    continue
+                param = descriptor.param if descriptor.param is not None else json_key
+                source = (
+                    "tensor",
+                    param,
+                    positional_positions.get(param),
+                    defaults.get(param, _MISSING),
+                    descriptor.tuple_idx,
+                    descriptor.dim_names.index(axis_name),
+                )
+                break
+
+            if source is None:
+                source = (
+                    "scalar",
+                    axis_name,
+                    positional_positions.get(axis_name),
+                    defaults.get(axis_name, _MISSING),
+                )
+            if isinstance(marker, Var):
+                axis_readers.append((axis_name, source, True, ""))
+            elif isinstance(marker, Const):
+                const_prefix = marker.abbrev if marker.abbrev is not None else axis_name
+                axis_readers.append((axis_name, source, False, const_prefix))
+        cached_output_root: Optional[str] = None
+
+        def record(args: tuple, kwargs: Dict[str, Any]) -> Optional[str]:
+            nonlocal cached_output_root
+            axes = []
+            const_parts = []
+            for axis_name, source, is_var_axis, const_prefix in axis_readers:
+                try:
+                    source_kind = source[0]
+                    if source_kind == "tensor":
+                        _, param, position, default, tuple_idx, dim_idx = source
+                        if position is not None and position < len(args):
+                            val = args[position]
+                        else:
+                            val = kwargs.get(param, default)
+                        if val is _MISSING:
+                            continue
+                        if tuple_idx is not None:
+                            if isinstance(val, (tuple, list)) and len(val) > tuple_idx:
+                                val = val[tuple_idx]
+                            else:
+                                continue
+                        if isinstance(val, torch.Tensor) and dim_idx < val.ndim:
+                            axis_value = int(val.shape[dim_idx])
+                        else:
+                            continue
+                    else:
+                        _, param, position, default = source
+                        if position is not None and position < len(args):
+                            val = args[position]
+                        else:
+                            val = kwargs.get(param, default)
+                        if val is _MISSING or val is None:
+                            continue
+                        axis_value = int(val)
+
+                    if is_var_axis:
+                        axes.append((axis_name, axis_value))
+                    elif const_prefix:
+                        const_parts.append(f"{const_prefix}{axis_value}")
+                except (TypeError, ValueError, AttributeError, IndexError):
+                    pass
+
+            name = name_prefix + ("_" + "_".join(const_parts) if const_parts else "")
+            if not _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED:
+                _install_workload_axis_autoflush()
+            if cached_output_root is None:
+                cached_output_root = _get_trace_workload_dump_dir()
+            _record_workload_axis_key(
+                output_root=cached_output_root,
+                op_type=template.op_type,
+                name=name,
+                axes=tuple(axes),
+            )
+            return name
+
+        return record
+
     # ------------------------------------------------------------------
     # fi_trace callable factory
     # ------------------------------------------------------------------
 
-    def build_fi_trace_fn(self, fi_api: str) -> Callable[..., Dict[str, Any]]:
+    def build_fi_trace_fn(
+        self,
+        fi_api: str,
+        *,
+        record_workload: bool = True,
+    ) -> Callable[..., Dict[str, Any]]:
         """Return a ``fi_trace(save_dir=None, **kwargs)`` callable.
 
         Parameters
@@ -631,6 +904,11 @@ class TraceTemplate:
         """
         axis_extractors = self._build_axis_extractors()
         template = self  # capture in closure
+        workload_var_axis_names = tuple(
+            axis_name
+            for axis_name, marker in template.axes.items()
+            if isinstance(marker, Var)
+        )
 
         def fi_trace(
             save_dir: Optional[Union[str, Path]] = None,
@@ -740,6 +1018,21 @@ class TraceTemplate:
                     const_parts.append(f"{pfx}{axis_values[n]}")
                 name = prefix + ("_" + "_".join(const_parts) if const_parts else "")
 
+            _is_auto_dump = save_dir is None
+            if (
+                record_workload
+                and _is_auto_dump
+                and _is_trace_workload_dump_enabled()
+            ):
+                _install_workload_axis_autoflush()
+                _record_workload_axis_sample(
+                    output_root=_get_trace_workload_dump_dir(),
+                    op_type=template.op_type,
+                    name=name,
+                    var_axis_names=workload_var_axis_names,
+                    axis_values=axis_values,
+                )
+
             # ── 7. Assemble definition ─────────────────────────────────────
             all_tags = [f"fi_api:{fi_api}"] + template.tags
             result: Dict[str, Any] = {
@@ -770,7 +1063,6 @@ class TraceTemplate:
             # named trace has been auto-dumped this process, skip re-writing it.
             # Explicit save_dir= calls always write (no dedup).
             effective_dir = save_dir if save_dir is not None else _get_trace_dump_dir()
-            _is_auto_dump = save_dir is None
             if effective_dir is not None and (
                 not _is_auto_dump or name not in _DUMPED_NAMES
             ):
