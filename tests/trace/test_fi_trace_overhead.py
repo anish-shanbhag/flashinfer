@@ -41,7 +41,6 @@ def isolated_trace_dump_state(monkeypatch):
     previous_dumped_names = set(template_mod._DUMPED_NAMES)
     previous_workload_counts = dict(template_mod._WORKLOAD_AXIS_COUNTS)
     previous_workload_record_count = template_mod._WORKLOAD_AXIS_RECORD_COUNT
-    previous_workload_flush_every = template_mod._WORKLOAD_AXIS_FLUSH_EVERY
     template_mod._DUMPED_NAMES.clear()
     template_mod._WORKLOAD_AXIS_COUNTS.clear()
     template_mod._WORKLOAD_AXIS_RECORD_COUNT = 0
@@ -58,7 +57,6 @@ def isolated_trace_dump_state(monkeypatch):
         template_mod._WORKLOAD_AXIS_COUNTS.clear()
         template_mod._WORKLOAD_AXIS_COUNTS.update(previous_workload_counts)
         template_mod._WORKLOAD_AXIS_RECORD_COUNT = previous_workload_record_count
-        template_mod._WORKLOAD_AXIS_FLUSH_EVERY = previous_workload_flush_every
         _clear_trace_source_caches(template_mod)
 
 
@@ -228,13 +226,11 @@ def test_fi_trace_auto_dump_mixed_repeated_shape_overhead_stays_low(
 def test_fi_trace_workload_axis_overhead_stays_low(
     tmp_path, monkeypatch, isolated_trace_dump_state
 ):
-    import flashinfer.trace.template as template_mod
     from flashinfer.trace.template import flush_workload_axis_dumps
 
     wrapped = _make_wrapped_rmsnorm_noop()
     x, weight = _make_rmsnorm_inputs(4)
 
-    template_mod._WORKLOAD_AXIS_FLUSH_EVERY = 1_000_000
     monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path / "defs"))
     monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
     monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path / "workloads"))
@@ -257,13 +253,11 @@ def test_fi_trace_workload_axis_overhead_stays_low(
 def test_fi_trace_dump_plus_workload_axis_combined_overhead_stays_low(
     tmp_path, monkeypatch, isolated_trace_dump_state
 ):
-    import flashinfer.trace.template as template_mod
     from flashinfer.trace.template import flush_workload_axis_dumps
 
     wrapped = _make_wrapped_rmsnorm_noop()
     x, weight = _make_rmsnorm_inputs(4)
 
-    template_mod._WORKLOAD_AXIS_FLUSH_EVERY = 1_000_000
     monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path / "defs"))
     monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
     monkeypatch.setenv("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR", str(tmp_path / "workloads"))

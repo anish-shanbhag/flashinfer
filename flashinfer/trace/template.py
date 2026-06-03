@@ -85,7 +85,6 @@ _WORKLOAD_AXIS_COUNTS: Dict[
 _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = False
 _WORKLOAD_AXIS_SIGNAL_HANDLERS: Dict[int, Any] = {}
 _WORKLOAD_AXIS_RECORD_COUNT = 0
-_WORKLOAD_AXIS_FLUSH_EVERY = 0
 _WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY = 1024
 
 
@@ -107,15 +106,6 @@ def _get_trace_workload_dump_dir() -> str:
     if trace_dir:
         return str(Path(trace_dir) / "workloads")
     return "fi_trace_workloads"
-
-
-def _get_workload_axis_flush_every() -> int:
-    raw_value = os.environ.get("FLASHINFER_TRACE_WORKLOAD_FLUSH_EVERY")
-    if raw_value is None:
-        return _WORKLOAD_AXIS_FLUSH_EVERY
-    with contextlib.suppress(ValueError):
-        return max(0, int(raw_value))
-    return _WORKLOAD_AXIS_FLUSH_EVERY
 
 
 def _install_workload_axis_autoflush(*, force: bool = False) -> None:
@@ -160,7 +150,6 @@ def _record_workload_axis_sample(
     name: str,
     var_axis_names: Tuple[str, ...],
     axis_values: Dict[str, int],
-    flush_every: Optional[int] = None,
 ) -> None:
     """Increment the in-memory workload-axis counter for one observed call."""
     axes = tuple(
@@ -173,7 +162,6 @@ def _record_workload_axis_sample(
         op_type=op_type,
         name=name,
         axes=axes,
-        flush_every=flush_every,
     )
 
 
@@ -183,17 +171,12 @@ def _record_workload_axis_key(
     op_type: str,
     name: str,
     axes: Tuple[Tuple[str, int], ...],
-    flush_every: Optional[int] = None,
 ) -> None:
     """Increment the in-memory workload-axis counter for one prepared key."""
     global _WORKLOAD_AXIS_RECORD_COUNT
     key = (output_root, op_type, name, axes)
     _WORKLOAD_AXIS_COUNTS[key] = _WORKLOAD_AXIS_COUNTS.get(key, 0) + 1
     _WORKLOAD_AXIS_RECORD_COUNT += 1
-    if flush_every is None:
-        flush_every = _get_workload_axis_flush_every()
-    if flush_every > 0 and _WORKLOAD_AXIS_RECORD_COUNT % flush_every == 0:
-        flush_workload_axis_dumps()
     if _WORKLOAD_AXIS_RECORD_COUNT % _WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY == 0:
         _install_workload_axis_autoflush(force=True)
 
@@ -878,10 +861,9 @@ class TraceTemplate:
                 const_prefix = marker.abbrev if marker.abbrev is not None else axis_name
                 axis_readers.append((axis_name, source, False, const_prefix))
         cached_output_root: Optional[str] = None
-        cached_flush_every: Optional[int] = None
 
         def record(args: tuple, kwargs: Dict[str, Any]) -> Optional[str]:
-            nonlocal cached_output_root, cached_flush_every
+            nonlocal cached_output_root
             axes = []
             const_parts = []
             for axis_name, source, is_var_axis, const_prefix in axis_readers:
@@ -926,13 +908,11 @@ class TraceTemplate:
                 _install_workload_axis_autoflush()
             if cached_output_root is None:
                 cached_output_root = _get_trace_workload_dump_dir()
-                cached_flush_every = _get_workload_axis_flush_every()
             _record_workload_axis_key(
                 output_root=cached_output_root,
                 op_type=template.op_type,
                 name=name,
                 axes=tuple(axes),
-                flush_every=cached_flush_every,
             )
             return name
 
