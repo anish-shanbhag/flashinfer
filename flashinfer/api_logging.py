@@ -2302,6 +2302,7 @@ def _attach_fi_trace(
             from flashinfer.trace.template import (  # noqa: PLC0415
                 TraceTemplate,
                 _is_trace_dump_enabled,
+                _is_trace_workload_dump_enabled,
             )
 
             # New interface: derive fi_api from the function's module + qualname.
@@ -2394,7 +2395,7 @@ def _attach_fi_trace(
                 # Generate trace BEFORE the actual call (crash-safe: schema
                 # depends only on input shapes/dtypes, not on whether the
                 # computation succeeds).
-                if _is_trace_dump_enabled():
+                if _is_trace_dump_enabled() or _is_trace_workload_dump_enabled():
                     try:
                         if _fast_bind_arguments is not None:
                             trace_kwargs = _fast_bind_arguments(args, kwargs)

@@ -75,6 +75,131 @@ _TRACE_DUMP_ENABLED: bool = _is_trace_dump_enabled()
 # In-memory deduplication: names of traces already written this process.
 _DUMPED_NAMES: set = set()
 
+# Workload-axis collection records the Var-axis tuple seen for each auto-dumped
+# trace definition. Counts stay in memory on the hot path and are flushed as
+# per-process shards, avoiding both per-call file I/O and cross-rank write races.
+_WORKLOAD_AXIS_COUNTS: Dict[
+    Tuple[str, str, str, Tuple[Tuple[str, int], ...]], int
+] = {}
+_WORKLOAD_AXIS_SEEN_KEYS: set = set()
+_WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = False
+_WORKLOAD_AXIS_SIGNAL_HANDLERS: Dict[int, Any] = {}
+_WORKLOAD_AXIS_RECORD_COUNT = 0
+_WORKLOAD_AXIS_FLUSH_EVERY = 512
+_WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY = 1024
+
+
+def _is_trace_workload_dump_enabled() -> bool:
+    """Return True if workload-axis aggregation is enabled."""
+    return os.environ.get("FLASHINFER_TRACE_WORKLOAD_DUMP", "0") not in ("0", "")
+
+
+def _get_trace_workload_dump_dir() -> str:
+    """Return the workload-axis output root.
+
+    Defaults to a ``workloads`` subdirectory under ``FLASHINFER_TRACE_DUMP_DIR``
+    so definition JSONs and workload-axis shards stay co-located.
+    """
+    explicit_dir = os.environ.get("FLASHINFER_TRACE_WORKLOAD_DUMP_DIR")
+    if explicit_dir:
+        return explicit_dir
+    trace_dir = _get_trace_dump_dir()
+    if trace_dir:
+        return str(Path(trace_dir) / "workloads")
+    return "fi_trace_workloads"
+
+
+def _install_workload_axis_autoflush(*, force: bool = False) -> None:
+    global _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED
+    if _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED and not force:
+        return
+
+    try:
+        import atexit
+        import signal
+    except Exception:  # pragma: no cover
+        return
+
+    if not _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED:
+        atexit.register(flush_workload_axis_dumps)
+        _WORKLOAD_AXIS_AUTOFLUSH_INSTALLED = True
+
+    def _make_signal_flush_handler(previous_handler):
+        def _signal_flush(signum, frame):
+            flush_workload_axis_dumps()
+            if callable(previous_handler):
+                previous_handler(signum, frame)
+            elif previous_handler == signal.SIG_DFL:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+        return _signal_flush
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(ValueError, OSError):
+            previous_handler = signal.getsignal(signum)
+            if previous_handler is _WORKLOAD_AXIS_SIGNAL_HANDLERS.get(signum):
+                continue
+            signal.signal(signum, _make_signal_flush_handler(previous_handler))
+            _WORKLOAD_AXIS_SIGNAL_HANDLERS[signum] = signal.getsignal(signum)
+
+
+def _record_workload_axis_sample(
+    *,
+    output_root: str,
+    op_type: str,
+    name: str,
+    var_axis_names: Tuple[str, ...],
+    axis_values: Dict[str, int],
+) -> None:
+    """Increment the in-memory workload-axis counter for one observed call."""
+    global _WORKLOAD_AXIS_RECORD_COUNT
+    axes = tuple(
+        (axis_name, int(axis_values[axis_name]))
+        for axis_name in var_axis_names
+        if axis_name in axis_values
+    )
+    key = (output_root, op_type, name, axes)
+    _WORKLOAD_AXIS_SEEN_KEYS.add(key)
+    _WORKLOAD_AXIS_COUNTS[key] = _WORKLOAD_AXIS_COUNTS.get(key, 0) + 1
+    _WORKLOAD_AXIS_RECORD_COUNT += 1
+    if _WORKLOAD_AXIS_RECORD_COUNT % _WORKLOAD_AXIS_FLUSH_EVERY == 0:
+        flush_workload_axis_dumps()
+    if _WORKLOAD_AXIS_RECORD_COUNT % _WORKLOAD_AXIS_SIGNAL_RECHECK_EVERY == 0:
+        _install_workload_axis_autoflush(force=True)
+
+
+def flush_workload_axis_dumps() -> int:
+    """Flush workload-axis counts to per-process JSONL shard files.
+
+    Files are written as ``<root>/<op_type>/<name>.pid_<pid>.jsonl``. A
+    downstream collector can aggregate duplicate axes across process shards by
+    summing ``count`` for matching ``(name, axes)`` records.
+    """
+    if not _WORKLOAD_AXIS_COUNTS:
+        return 0
+
+    pending = list(_WORKLOAD_AXIS_COUNTS.items())
+    _WORKLOAD_AXIS_COUNTS.clear()
+    grouped: Dict[
+        Tuple[str, str, str],
+        List[Tuple[Tuple[Tuple[str, int], ...], int]],
+    ] = {}
+    for (output_root, op_type, name, axes), count in pending:
+        grouped.setdefault((output_root, op_type, name), []).append((axes, count))
+
+    pid = os.getpid()
+    records_written = 0
+    for (output_root, op_type, name), records in grouped.items():
+        out_dir = Path(output_root) / op_type
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{name}.pid_{pid}.jsonl"
+        with out_path.open("a") as f:
+            for axes, count in sorted(records, key=lambda item: item[0]):
+                f.write(json.dumps({"axes": dict(axes), "count": count}) + "\n")
+                records_written += 1
+    return records_written
+
 # ---------------------------------------------------------------------------
 # Dtype helpers
 # ---------------------------------------------------------------------------
@@ -643,6 +768,11 @@ class TraceTemplate:
         axis_extractors = self._build_axis_extractors()
         template = self  # capture in closure
         result_cache: Dict[str, Dict[str, Any]] = {}
+        workload_var_axis_names = tuple(
+            axis_name
+            for axis_name, marker in template.axes.items()
+            if isinstance(marker, Var)
+        )
 
         def _resolve_name(
             explicit_name: Optional[str],
@@ -689,6 +819,15 @@ class TraceTemplate:
             name = _resolve_name(name, axis_values)
             effective_dir = save_dir if save_dir is not None else _get_trace_dump_dir()
             _is_auto_dump = save_dir is None
+            if _is_auto_dump and _is_trace_workload_dump_enabled():
+                _install_workload_axis_autoflush()
+                _record_workload_axis_sample(
+                    output_root=_get_trace_workload_dump_dir(),
+                    op_type=template.op_type,
+                    name=name,
+                    var_axis_names=workload_var_axis_names,
+                    axis_values=axis_values,
+                )
             if (
                 _is_auto_dump
                 and effective_dir is not None
