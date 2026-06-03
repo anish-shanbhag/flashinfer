@@ -2301,6 +2301,7 @@ def _attach_fi_trace(
         if trace_template is not None:
             from flashinfer.trace.template import (  # noqa: PLC0415
                 TraceTemplate,
+                _DUMPED_NAMES,
                 _is_trace_dump_enabled,
                 _is_trace_workload_dump_enabled,
             )
@@ -2311,9 +2312,19 @@ def _attach_fi_trace(
             fi_api = f"{module}.{qualname}" if module else qualname
 
             fi_init_fn: Optional[Callable] = None
+            fi_trace_auto_dump_fn: Callable
+            workload_axis_recorder: Optional[
+                Callable[[tuple, Dict[str, Any]], Optional[str]]
+            ] = None
+            static_trace_template: Optional[TraceTemplate] = None
             if isinstance(trace_template, TraceTemplate):
                 # Static template: pre-build the fi_trace callable once.
                 fi_trace_fn = trace_template.build_fi_trace_fn(fi_api)
+                fi_trace_auto_dump_fn = trace_template.build_fi_trace_fn(
+                    fi_api,
+                    record_workload=False,
+                )
+                static_trace_template = trace_template
                 # Register for auto-discovery by consistency tests.
                 label = trace_template.name_prefix or trace_template.op_type
                 _TRACE_REGISTRY.append((original, trace_template, label))
@@ -2353,6 +2364,8 @@ def _attach_fi_trace(
                         save_dir=save_dir, name=name, **kwargs
                     )
 
+                fi_trace_auto_dump_fn = fi_trace_fn
+
                 # Dispatch case: fi_init must also dispatch by kwargs. We
                 # attach a callable that resolves the template via the
                 # dispatch fn and forwards the call to its .init. This
@@ -2385,6 +2398,10 @@ def _attach_fi_trace(
             _inner = wrapped
             _sig = inspect.signature(original)
             _fast_bind_arguments = _build_fast_bound_arguments(_sig)
+            if static_trace_template is not None:
+                workload_axis_recorder = (
+                    static_trace_template.build_workload_axis_recorder(_sig)
+                )
 
             # Track which (function, error-type) pairs have already been warned
             # about so we emit at most one diagnostic per failure class per process.
@@ -2395,15 +2412,38 @@ def _attach_fi_trace(
                 # Generate trace BEFORE the actual call (crash-safe: schema
                 # depends only on input shapes/dtypes, not on whether the
                 # computation succeeds).
-                if _is_trace_dump_enabled() or _is_trace_workload_dump_enabled():
+                trace_dump_enabled = _is_trace_dump_enabled()
+                workload_dump_enabled = _is_trace_workload_dump_enabled()
+                if trace_dump_enabled or workload_dump_enabled:
                     try:
-                        if _fast_bind_arguments is not None:
-                            trace_kwargs = _fast_bind_arguments(args, kwargs)
-                        else:
-                            bound = _sig.bind(*args, **kwargs)
-                            bound.apply_defaults()
-                            trace_kwargs = dict(bound.arguments)
-                        fi_trace_fn(**trace_kwargs)
+                        trace_name = None
+                        if workload_dump_enabled and workload_axis_recorder is not None:
+                            trace_name = workload_axis_recorder(args, kwargs)
+
+                        needs_full_trace = trace_dump_enabled
+                        if (
+                            trace_dump_enabled
+                            and workload_dump_enabled
+                            and trace_name is not None
+                            and trace_name in _DUMPED_NAMES
+                        ):
+                            needs_full_trace = False
+                        if workload_dump_enabled and workload_axis_recorder is None:
+                            needs_full_trace = True
+
+                        if needs_full_trace:
+                            if _fast_bind_arguments is not None:
+                                trace_kwargs = _fast_bind_arguments(args, kwargs)
+                            else:
+                                bound = _sig.bind(*args, **kwargs)
+                                bound.apply_defaults()
+                                trace_kwargs = dict(bound.arguments)
+                            fi_trace_fn_to_call = (
+                                fi_trace_auto_dump_fn
+                                if workload_axis_recorder is not None
+                                else fi_trace_fn
+                            )
+                            fi_trace_fn_to_call(**trace_kwargs)
                     except Exception as _exc:
                         # Non-fatal: the API call still runs. Warn once per
                         # (function, error-type) so users get a diagnostic
