@@ -371,6 +371,20 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
 
+#ifdef ENABLE_BF16
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    if (n == 512 && sfLayout == QuantizationSFLayout::SWIZZLED_128x4 &&
+        !disableFP4QuantFastMath && !use4Over6) {
+      dim3 const fastBlock(256);
+      dim3 const fastGrid((m + 7) / 8);
+      nvfp4QuantAndPerTokenScaleBf16K512Swizzled128x4Kernel<<<fastGrid, fastBlock, 0, stream>>>(
+          m, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+          perTokenScaleOutput);
+      return;
+    }
+  }
+#endif
+
   auto launchKernel = [&](auto sfLayoutTag, auto disableFP4QuantFastMathTag,
                           auto nvfp4_4over6_config_tag) {
     constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;

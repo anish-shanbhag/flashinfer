@@ -790,6 +790,81 @@ def set_nvfp4_quant_env():
             os.environ[name] = value
 
 
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_per_token_row_map_skips_masked_rows(
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    set_nvfp4_quant_env(nvfp4_4over6_config=None, disable_quant_fast_math=False)
+
+    m, n = 256, 512
+    torch.manual_seed(42)
+    x = torch.randn((m, n), dtype=torch.bfloat16, device=device)
+    scale_inv = float(
+        nvfp4_global_decode_scale_te(
+            torch.ones((), dtype=torch.float32, device=device), None
+        ).item()
+    )
+    row_map = torch.full((m,), -1, dtype=torch.int32, device=device)
+
+    _, scale, _ = nvfp4_quantize(
+        x,
+        scale_inv,
+        sfLayout=SfLayout.layout_128x4,
+        backend="cuda",
+        per_token_activation=True,
+        expanded_idx_to_permuted_idx=row_map,
+    )
+
+    assert not torch.any(scale)
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_per_token_row_map_matches_unmapped_rows(
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    set_nvfp4_quant_env(nvfp4_4over6_config=None, disable_quant_fast_math=False)
+
+    m, n = 256, 512
+    torch.manual_seed(43)
+    x = torch.randn((m, n), dtype=torch.bfloat16, device=device)
+    scale_inv = float(
+        nvfp4_global_decode_scale_te(
+            torch.ones((), dtype=torch.float32, device=device), None
+        ).item()
+    )
+    expected_output, expected_scale, expected_per_token_scale = nvfp4_quantize(
+        x,
+        scale_inv,
+        sfLayout=SfLayout.layout_128x4,
+        backend="cuda",
+        per_token_activation=True,
+    )
+    row_map = torch.arange(m - 1, -1, -1, dtype=torch.int32, device=device)
+
+    output, scale, per_token_scale = nvfp4_quantize(
+        x,
+        scale_inv,
+        sfLayout=SfLayout.layout_128x4,
+        backend="cuda",
+        per_token_activation=True,
+        expanded_idx_to_permuted_idx=row_map,
+    )
+
+    assert torch.equal(output, expected_output)
+    assert torch.equal(scale, expected_scale)
+    assert torch.equal(per_token_scale, expected_per_token_scale)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)

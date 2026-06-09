@@ -724,6 +724,131 @@ cvt_fp16_to_fp4_expert(
 __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
+__device__ __forceinline__ uint32_t pack_fp32_to_e2m1x8(float const* values) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t packed;
+  asm volatile(
+      "{\n\t"
+      ".reg .b8 b0, b1, b2, b3;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n\t"
+      "mov.b32 %0, {b0, b1, b2, b3};\n\t"
+      "}"
+      : "=r"(packed)
+      : "f"(values[0]), "f"(values[1]), "f"(values[2]), "f"(values[3]), "f"(values[4]),
+        "f"(values[5]), "f"(values[6]), "f"(values[7]));
+  return packed;
+#else
+  return 0;
+#endif
+}
+
+// Specialized BF16 [M, 512] per-token NVFP4 path for SWIZZLED_128x4 scales.
+__global__ void __launch_bounds__(256)
+    nvfp4QuantAndPerTokenScaleBf16K512Swizzled128x4Kernel(
+        uint32_t m, __nv_bfloat16 const* __restrict__ input, float globalScaleInv,
+        int32_t* __restrict__ expandedIdxToPermutedIdx, uint8_t* __restrict__ weightOutput,
+        uint8_t* __restrict__ scaleOutput, float* __restrict__ perTokenScaleOutput) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  constexpr int K = 512;
+  constexpr float INV6 = 1.0f / 6.0f;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaGridDependencySynchronize();
+#endif
+
+  int const logicalRow = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int const lane = threadIdx.x & 31;
+  bool active = logicalRow < static_cast<int>(m);
+  int row = logicalRow;
+  if (active && expandedIdxToPermutedIdx != nullptr) {
+    row = expandedIdxToPermutedIdx[logicalRow];
+  }
+  active = active && row >= 0 && row < static_cast<int>(m);
+
+  if (active) {
+    __nv_bfloat16 const* rowPtr = input + static_cast<int64_t>(row) * K + lane * 16;
+    uint4 first = *reinterpret_cast<uint4 const*>(rowPtr);
+    uint4 second = *reinterpret_cast<uint4 const*>(rowPtr + 8);
+
+    float values[16];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      uint32_t word = (&first.x)[i];
+      float2 pair = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&word));
+      values[2 * i] = pair.x;
+      values[2 * i + 1] = pair.y;
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      uint32_t word = (&second.x)[i];
+      float2 pair = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&word));
+      values[8 + 2 * i] = pair.x;
+      values[8 + 2 * i + 1] = pair.y;
+    }
+
+    float m0 = fmaxf(fabsf(values[0]), fabsf(values[1]));
+    float m1 = fmaxf(fabsf(values[2]), fabsf(values[3]));
+    float m2 = fmaxf(fabsf(values[4]), fabsf(values[5]));
+    float m3 = fmaxf(fabsf(values[6]), fabsf(values[7]));
+    float m4 = fmaxf(fabsf(values[8]), fabsf(values[9]));
+    float m5 = fmaxf(fabsf(values[10]), fabsf(values[11]));
+    float m6 = fmaxf(fabsf(values[12]), fabsf(values[13]));
+    float m7 = fmaxf(fabsf(values[14]), fabsf(values[15]));
+    float groupAmax = fmaxf(fmaxf(fmaxf(m0, m1), fmaxf(m2, m3)),
+                            fmaxf(fmaxf(m4, m5), fmaxf(m6, m7)));
+
+    uint32_t rowAmaxBits;
+    asm volatile("redux.sync.max.u32 %0, %1, %2;"
+                 : "=r"(rowAmaxBits)
+                 : "r"(__float_as_uint(groupAmax)), "r"(0xffffffffu));
+    float rowAmax = __uint_as_float(rowAmaxBits);
+
+    int const innerK = lane & 3;
+    int const kTile = lane >> 2;
+    int const innerM = (row & 127) >> 5;
+    int const outerM = row & 31;
+    int const mTile = row >> 7;
+    int64_t const scaleOffset =
+        static_cast<int64_t>(mTile) * 4096 + kTile * 512 + outerM * 16 + innerM * 4 + innerK;
+
+    if (rowAmax == 0.0f) {
+      *reinterpret_cast<uint2*>(weightOutput + static_cast<int64_t>(row) * 256 + lane * 8) =
+          make_uint2(0, 0);
+      scaleOutput[scaleOffset] = 0;
+      if (lane == 0) {
+        perTokenScaleOutput[row] = 0.0f;
+      }
+    } else {
+      float const perTokenScale = rowAmax * globalScaleInv;
+      float const globalEncodeScale = reciprocal_approximate_ftz(perTokenScale);
+      float const sfF32 = groupAmax * globalEncodeScale * INV6;
+      __nv_fp8_e4m3 const sf8(sfF32);
+      float const outputScale = reciprocal_approximate_ftz(static_cast<float>(sf8) * perTokenScale);
+
+      float scaled[16];
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        scaled[i] = values[i] * outputScale;
+      }
+
+      *reinterpret_cast<uint2*>(weightOutput + static_cast<int64_t>(row) * 256 + lane * 8) =
+          make_uint2(pack_fp32_to_e2m1x8(scaled), pack_fp32_to_e2m1x8(scaled + 8));
+      scaleOutput[scaleOffset] = sf8.__x;
+      if (lane == 0) {
+        perTokenScaleOutput[row] = perTokenScale;
+      }
+    }
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+#endif
+}
+
 template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_INPUT = true,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
