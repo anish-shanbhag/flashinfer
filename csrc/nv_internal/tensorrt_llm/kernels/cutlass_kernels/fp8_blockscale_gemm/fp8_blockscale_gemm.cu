@@ -41,7 +41,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
 
   if constexpr (internal_quantize_a) {
     fp8_mat_a = reinterpret_cast<__nv_fp8_e4m3*>(ws_ptr);
-    ws_ptr += max_shape_m_4_align_ * shape_k * sizeof(__nv_fp8_e4m3);
+    ws_ptr += (max_shape_m_32_align_padded_ + 256) * shape_k * sizeof(__nv_fp8_e4m3)  /*NANFIX-INB3*/;
     per_token_per_128c_scales = reinterpret_cast<float*>(ws_ptr);
     ws_ptr += max_shape_m_4_align_ * div_up(shape_k, 128) * sizeof(float);
   }
@@ -112,9 +112,9 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 
   if constexpr (internal_quantize_a) {
     fp8_mat_a = reinterpret_cast<__nv_fp8_e4m3*>(ws_ptr);
-    ws_ptr += max_shape_m_4_align_ * shape_k * sizeof(__nv_fp8_e4m3);
+    ws_ptr += (max_shape_m_32_align_padded_ + 256) * shape_k * sizeof(__nv_fp8_e4m3)  /*NANFIX-INB3*/;
     per_token_per_128c_scales = reinterpret_cast<float*>(ws_ptr);
-    ws_ptr += max_shape_m_32_align_padded_ * div_up(shape_k, 128) * sizeof(float);
+    ws_ptr += (max_shape_m_32_align_padded_ + 256) * div_up(shape_k, 128) * sizeof(float)  /*NANFIX-INB3*/;
   } else {
     fp8_mat_a = reinterpret_cast<__nv_fp8_e4m3*>(const_cast<void*>(mat_a));
     per_token_per_128c_scales = const_cast<float*>(scales_a);
@@ -227,9 +227,9 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
   size_t total_workspace_size = 0;
   if constexpr (internal_quantize_a) {
     // fp8_mat_a
-    total_workspace_size += max_shape_m_4_align_ * shape_k * sizeof(__nv_fp8_e4m3);
+    total_workspace_size += (max_shape_m_32_align_padded_ + 256) * shape_k * sizeof(__nv_fp8_e4m3)  /*NANFIX-INB3*/;
     // scales_a
-    total_workspace_size += max_shape_m_32_align_padded_ * div_up(shape_k, 128) * sizeof(float);
+    total_workspace_size += (max_shape_m_32_align_padded_ + 256) * div_up(shape_k, 128) * sizeof(float)  /*NANFIX-INB3*/;
   }
 
   if constexpr (internal_quantize_b) {

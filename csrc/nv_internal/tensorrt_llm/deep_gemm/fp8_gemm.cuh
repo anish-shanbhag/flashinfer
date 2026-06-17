@@ -279,12 +279,12 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
              uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
              LayoutIndexType* problem_m_offsets, cudaStream_t stream, int num_sms,
              uint32_t smem_size, uint32_t max_shape_m_padded) {
-  auto tma_a_desc = make_2d_tma_a_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k,
+  auto tma_a_desc = make_2d_tma_a_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), max_shape_m_padded + 256, shape_k,  // NANFIX-INB3
                                        block_m, block_k, num_groups, gemm_type);
   auto tma_b_desc = make_2d_tma_b_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k,
                                        block_n, block_k, num_groups, gemm_type);
   auto tma_scales_a_desc =
-      make_tma_scales_a_offset_desc(scales_a, max_shape_m_padded, shape_k, block_m, block_k);
+      make_tma_scales_a_offset_desc(scales_a, /*NANFIX-INB3*/ max_shape_m_padded + 256, shape_k, block_m, block_k);
   auto tma_d_desc = make_2d_tma_d_desc(reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n,
                                        block_m, block_n, num_groups, gemm_type);
   constexpr uint32_t kNumTMAThreads = 128;
@@ -329,10 +329,10 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void*
   // Create tensor mappings using swapAB version functions, note the parameter order
   auto tma_a_desc = make_2d_tma_a_desc_swapAB(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m,
                                               shape_k, block_m, block_k, num_groups, gemm_type);
-  auto tma_b_desc = make_2d_tma_b_desc_swapAB(reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n,
+  auto tma_b_desc = make_2d_tma_b_desc_swapAB(reinterpret_cast<__nv_fp8_e4m3*>(mat_b), max_shape_n_padded + 256,  // NANFIX-INB3
                                               shape_k, block_n, block_k, num_groups, gemm_type);
   auto tma_scales_b_desc =
-      make_tma_scales_b_offset_desc_swapAB(scales_b, max_shape_n_padded, shape_k, block_n, block_k);
+      make_tma_scales_b_offset_desc_swapAB(scales_b, /*NANFIX-INB3*/ max_shape_n_padded + 256, shape_k, block_n, block_k);
   auto tma_d_desc = make_2d_tma_d_desc_swapAB(reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m,
                                               shape_n, block_m, block_n, num_groups, gemm_type);
   constexpr uint32_t kNumTMAThreads = 128;

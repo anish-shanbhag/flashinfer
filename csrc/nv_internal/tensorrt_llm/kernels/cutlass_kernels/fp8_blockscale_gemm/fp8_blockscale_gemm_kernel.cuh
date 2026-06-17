@@ -1,3 +1,4 @@
+#include <cstdio>
 /*
  * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -971,8 +972,9 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
     InputType input_frag[4];
 
     for (int i = 0; i < 4; i++) {
-      input_frag[i] =
+      InputType v =
           (scales_idx_x * 128 + i * 32 + lane_id < dim_x) ? input_line[lane_id] : InputType(0);
+      input_frag[i] = isfinite(float(v)) ? v : InputType(0);  // NANFIX-INB3 qclamp
       input_line += 32;
     }
 
@@ -1525,6 +1527,10 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
         static_cast<double>(max_shape_m) * scales_dim_x /
             static_cast<double>(NumThreads * num_blocks / 32) <=
         static_cast<double>(num_problems) / std::log2(static_cast<double>(num_problems));
+    // NANFIX-INB3: zero fp8 activation data + per-token scales over the (padded+slack) extent the
+    // now-padded-extent activation TMA descriptors read in-bounds; quant overwrites valid rows.
+    cudaMemsetAsync(fp8_mat_a, 0, (size_t)(max_shape_m_padded + 256) * (size_t)shape_k * sizeof(__nv_fp8_e4m3), stream);
+    cudaMemsetAsync(scales_a, 0, (size_t)(max_shape_m_padded + 256) * (size_t)div_up(shape_k, 128) * sizeof(float), stream);
     auto kernel = use_binary_search ? scale_1x128_kernel<true, __nv_bfloat16, __nv_fp8_e4m3>
                                     : scale_1x128_kernel<false, __nv_bfloat16, __nv_fp8_e4m3>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
