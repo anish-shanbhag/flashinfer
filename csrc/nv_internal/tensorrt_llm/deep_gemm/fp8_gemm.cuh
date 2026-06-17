@@ -49,7 +49,8 @@ static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m, uint3
                                       GemmType gemm_type, uint64_t global_stride_in_bytes = 0) {
   return make_2d_tma_desc(global_address, Layout::RowMajor,
                           shape_m * (gemm_type == GemmType::GroupedMasked ? num_groups : 1),
-                          shape_k, block_m, block_k, global_stride_in_bytes);
+                          shape_k, block_m, block_k, global_stride_in_bytes, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+                          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);  // NANFIX-OOB
 }
 
 template <typename T>
@@ -112,7 +113,8 @@ CUtensorMap make_2d_tma_b_desc_swapAB(T* global_address, uint32_t shape_n, uint3
                                       GemmType gemm_type, uint64_t global_stride_in_bytes = 0) {
   return make_2d_tma_desc(global_address, Layout::ColMajor, shape_k,
                           shape_n * (gemm_type == GemmType::GroupedMasked ? num_groups : 1),
-                          block_k, block_n, global_stride_in_bytes);
+                          block_k, block_n, global_stride_in_bytes, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+                          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);  // NANFIX-OOB
 }
 
 template <typename T>
@@ -157,21 +159,22 @@ template <typename T>
 CUtensorMap make_2d_tma_desc(
     T* global_address, Layout layout, uint32_t gmem_rows, uint32_t gmem_cols, uint32_t smem_rows,
     uint32_t smem_cols, uint64_t global_stride_in_bytes,
-    CUtensorMapSwizzle swizzle_type = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B) {
+    CUtensorMapSwizzle swizzle_type = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    CUtensorMapFloatOOBfill oob_fill = CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) {
   if (layout == Layout::RowMajor) {
     uint64_t gmem_dim[2] = {gmem_cols, gmem_rows};
     uint32_t smem_dim[2] = {smem_cols, smem_rows};
     global_stride_in_bytes =
         global_stride_in_bytes ? global_stride_in_bytes : gmem_cols * sizeof(T);
     return make_2d_tma_copy_desc(global_address, gmem_dim, global_stride_in_bytes, smem_dim,
-                                 swizzle_type);
+                                 swizzle_type, oob_fill);
   } else {
     uint64_t gmem_dim[2] = {gmem_rows, gmem_cols};
     uint32_t smem_dim[2] = {smem_rows, smem_cols};
     global_stride_in_bytes =
         global_stride_in_bytes ? global_stride_in_bytes : gmem_rows * sizeof(T);
     return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_rows * sizeof(T), smem_dim,
-                                 swizzle_type);
+                                 swizzle_type, oob_fill);
   }
 }
 

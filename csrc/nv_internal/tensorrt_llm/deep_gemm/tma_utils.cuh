@@ -1,3 +1,4 @@
+#include <cstdio>
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 DeepSeek
  * SPDX-License-Identifier: MIT
@@ -93,6 +94,7 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
 template <typename T>
 CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2], uint64_t stride_in_bytes,
                                   uint32_t smem_dim[2], CUtensorMapSwizzle swizzle_type,
+                                  CUtensorMapFloatOOBfill oob_fill = CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
                                   PFN_cuTensorMapEncodeTiled_v12000 encode_func = nullptr) {
   CUtensorMap tensor_map{};
   constexpr uint32_t rank = 2;
@@ -106,8 +108,12 @@ CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2], uint6
                   global_address, gmem_dim, global_stride, smem_dim, elem_strides,
                   CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
                   CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  DG_HOST_ASSERT(result == CUDA_SUCCESS);
+                  oob_fill);  // NANFIX-OOB
+  if (result != CUDA_SUCCESS) { const char* es = nullptr; cuGetErrorString(result, &es);
+    fprintf(stderr, "NANFIX_TMA_FAIL result=%d (%s) swizzle=%d oob=%d gdim0=%lu gdim1=%lu sdim0=%u sdim1=%u\n",
+      (int)result, es ? es : "?", (int)swizzle_type, (int)oob_fill,
+      (unsigned long)gmem_dim[0], (unsigned long)gmem_dim[1], smem_dim[0], smem_dim[1]); }
+    DG_HOST_ASSERT(result == CUDA_SUCCESS);
   return tensor_map;
 }
 #endif
