@@ -41,7 +41,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
 
   if constexpr (internal_quantize_a) {
     fp8_mat_a = reinterpret_cast<__nv_fp8_e4m3*>(ws_ptr);
-    ws_ptr += max_shape_m_4_align_ * shape_k * sizeof(__nv_fp8_e4m3);
+    ws_ptr += (max_shape_m_32_align_padded_ + 256) * shape_k * sizeof(__nv_fp8_e4m3)  /*NANFIX-INB2*/;
     per_token_per_128c_scales = reinterpret_cast<float*>(ws_ptr);
     ws_ptr += max_shape_m_4_align_ * div_up(shape_k, 128) * sizeof(float);
   }
@@ -112,7 +112,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 
   if constexpr (internal_quantize_a) {
     fp8_mat_a = reinterpret_cast<__nv_fp8_e4m3*>(ws_ptr);
-    ws_ptr += max_shape_m_4_align_ * shape_k * sizeof(__nv_fp8_e4m3);
+    ws_ptr += (max_shape_m_32_align_padded_ + 256) * shape_k * sizeof(__nv_fp8_e4m3)  /*NANFIX-INB2*/;
     per_token_per_128c_scales = reinterpret_cast<float*>(ws_ptr);
     ws_ptr += max_shape_m_32_align_padded_ * div_up(shape_k, 128) * sizeof(float);
   } else {
@@ -227,7 +227,7 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
   size_t total_workspace_size = 0;
   if constexpr (internal_quantize_a) {
     // fp8_mat_a
-    total_workspace_size += max_shape_m_4_align_ * shape_k * sizeof(__nv_fp8_e4m3);
+    total_workspace_size += (max_shape_m_32_align_padded_ + 256) * shape_k * sizeof(__nv_fp8_e4m3)  /*NANFIX-INB2*/;
     // scales_a
     total_workspace_size += max_shape_m_32_align_padded_ * div_up(shape_k, 128) * sizeof(float);
   }

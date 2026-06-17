@@ -1,3 +1,4 @@
+#include <cstdio>
 /*
  * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -1525,6 +1526,9 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
         static_cast<double>(max_shape_m) * scales_dim_x /
             static_cast<double>(NumThreads * num_blocks / 32) <=
         static_cast<double>(num_problems) / std::log2(static_cast<double>(num_problems));
+    // NANFIX-INB2: zero fp8 activation scratch over the (padded+slack) extent the activation TMA
+    // descriptor now reads in-bounds; quant overwrites valid rows, padded tail stays 0.
+    cudaMemsetAsync(fp8_mat_a, 0, (size_t)(max_shape_m_padded + 256) * (size_t)shape_k * sizeof(__nv_fp8_e4m3), stream);
     auto kernel = use_binary_search ? scale_1x128_kernel<true, __nv_bfloat16, __nv_fp8_e4m3>
                                     : scale_1x128_kernel<false, __nv_bfloat16, __nv_fp8_e4m3>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
