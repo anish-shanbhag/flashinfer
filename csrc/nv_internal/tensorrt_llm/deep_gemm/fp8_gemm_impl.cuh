@@ -315,6 +315,24 @@ __global__ void __launch_bounds__(
           // Wait TMA arrivals
           full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
+          // NANFIX-BCLAMPV: vectorized (uint32) gated clamp of stale fp8 e4m3-NaN in smem_a
+          if ((scheduler.get_global_m_idx(m_block_idx) + BLOCK_M) > scheduler.m_boundary) {
+            uint32_t* nf_p4 = reinterpret_cast<uint32_t*>(smem_a[s]);
+            int nf_n4 = (int)(SMEM_A_SIZE_PER_STAGE) / 4;
+            for (int nf_e = threadIdx.x; nf_e < nf_n4; nf_e += kNumMathThreads) {
+              uint32_t nf_w = nf_p4[nf_e];
+              uint32_t nf_nm = ((nf_w & 0x7f7f7f7fu) + 0x01010101u) & 0x80808080u;
+              if (nf_nm) {
+                if ((nf_w & 0x7fu) == 0x7fu) nf_w &= 0xffffff00u;
+                if (((nf_w >> 8) & 0x7fu) == 0x7fu) nf_w &= 0xffff00ffu;
+                if (((nf_w >> 16) & 0x7fu) == 0x7fu) nf_w &= 0xff00ffffu;
+                if (((nf_w >> 24) & 0x7fu) == 0x7fu) nf_w &= 0x00ffffffu;
+                nf_p4[nf_e] = nf_w;
+              }
+            }
+            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+          }
+
           // Read A scales
           // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next
           // scheduled block polluting the results
@@ -688,6 +706,23 @@ __global__ void __launch_bounds__(
 
           // Wait TMA arrivals
           full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+          // NANFIX-BCLAMPV: vectorized (uint32) gated clamp of stale fp8 e4m3-NaN in smem_b
+          if ((scheduler.get_global_n_idx(n_block_idx) + BLOCK_N) > scheduler.n_boundary) {
+            uint32_t* nf_p4 = reinterpret_cast<uint32_t*>(smem_b[s]);
+            int nf_n4 = (int)(SMEM_B_SIZE_PER_STAGE) / 4;
+            for (int nf_e = threadIdx.x; nf_e < nf_n4; nf_e += kNumMathThreads) {
+              uint32_t nf_w = nf_p4[nf_e];
+              uint32_t nf_nm = ((nf_w & 0x7f7f7f7fu) + 0x01010101u) & 0x80808080u;
+              if (nf_nm) {
+                if ((nf_w & 0x7fu) == 0x7fu) nf_w &= 0xffffff00u;
+                if (((nf_w >> 8) & 0x7fu) == 0x7fu) nf_w &= 0xffff00ffu;
+                if (((nf_w >> 16) & 0x7fu) == 0x7fu) nf_w &= 0xff00ffffu;
+                if (((nf_w >> 24) & 0x7fu) == 0x7fu) nf_w &= 0x00ffffffu;
+                nf_p4[nf_e] = nf_w;
+              }
+            }
+            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+          }
 
           // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next
           // scheduled block polluting the results Each thread reads consecutive two b scales, each
